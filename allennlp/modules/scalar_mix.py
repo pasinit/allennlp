@@ -1,4 +1,4 @@
-from typing import List
+from typing import List, Union
 
 import torch
 from torch.nn import ParameterList, Parameter
@@ -96,23 +96,23 @@ class ScalarMix(torch.nn.Module):
 
 
 class SumMix(torch.nn.Module):
-    def __init__(self, layers_to_sum: List):
+    def __init__(self, layers_to_sum: List, **kwargs):
         super().__init__()
         assert len(layers_to_sum) > 1
         self.indices_to_sum = layers_to_sum
-        assert min(self.indices_to_sum) >= 0
         self.max_layer_idx = max(self.indices_to_sum)
 
-    def forward(self, tensors: List[torch.Tensor]):
+    def forward(self, tensors: Union[List[torch.Tensor], torch.Tensor], *args, **kwargs):
         """
         computes the sum of the embeddings of the layers defined self.indices_to_sum
         :param tensors:  The input tensors can be any shape with at least two dimensions, but must all be the same shape.
         :return: the sum of the last dimension of tensors for the indices in the first dimension corresponding to self.indices_to_sum
         """
-        if self.max_layer_idx < len(tensors):
+        if self.max_layer_idx > len(tensors):
             raise RuntimeError("The input indices has the index {} that is out of the bound of the input tensor "
                                "list with size {}".format(self.max_layer_idx, len(tensors)))
-        accum_tensor = tensors[self.indices_to_sum[0]]
-        for idx in self.indices_to_sum[1:]:
-            accum_tensor = accum_tensor + tensors[idx]
-        return accum_tensor
+        return sum(tensors[self.indices_to_sum])
+        # accum_tensor = tensors[self.indices_to_sum[0]]
+        # for idx in self.indices_to_sum[1:]:
+        #     accum_tensor = accum_tensor + tensors[idx]
+        # return accum_tensor

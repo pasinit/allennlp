@@ -78,10 +78,11 @@ class WordpieceIndexer(TokenIndexer[int]):
         separator_token: str = "[SEP]",
         truncate_long_sequences: bool = True,
         token_min_padding_length: int = 0,
+            mode="bert"
     ) -> None:
         super().__init__(token_min_padding_length)
         self.vocab = vocab
-
+        self.mode=mode
         # The BERT code itself does a two-step tokenization:
         #    sentence -> [words], and then word -> [wordpieces]
         # In AllenNLP, the first step is implemented as the ``BertBasicWordSplitter``,
@@ -307,7 +308,21 @@ class WordpieceIndexer(TokenIndexer[int]):
         desired_num_tokens: Dict[str, int],
         padding_lengths: Dict[str, int],
     ) -> Dict[str, torch.Tensor]:
+        if self.mode == "qbert":
+            ret = {}
+            for key, val in tokens.items():
+                if key == "tokens":
+                    new_val = torch.LongTensor(pad_sequence_to_length(val[:-1], desired_num_tokens[key]))
+                    new_val[-1] = 102
+                elif key == "mask":
+                    new_val = torch.LongTensor(pad_sequence_to_length(val[:-1], desired_num_tokens[key]))
+                    new_val[-1] = 1
+                else:
+                    new_val = torch.LongTensor(pad_sequence_to_length(val, desired_num_tokens[key]))
+                ret[key] = new_val
+            return ret
         return {
+
             key: torch.LongTensor(pad_sequence_to_length(val, desired_num_tokens[key]))
             for key, val in tokens.items()
         }
@@ -364,6 +379,7 @@ class PretrainedBertIndexer(WordpieceIndexer):
         never_lowercase: List[str] = None,
         max_pieces: int = 512,
         truncate_long_sequences: bool = True,
+        **kwargs
     ) -> None:
         if pretrained_model.endswith("-cased") and do_lowercase:
             logger.warning(
@@ -387,7 +403,7 @@ class PretrainedBertIndexer(WordpieceIndexer):
             start_tokens=["[CLS]"],
             end_tokens=["[SEP]"],
             separator_token="[SEP]",
-            truncate_long_sequences=truncate_long_sequences,
+            truncate_long_sequences=truncate_long_sequences,**kwargs
         )
 
     def __eq__(self, other):
