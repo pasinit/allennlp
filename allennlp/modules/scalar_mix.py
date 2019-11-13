@@ -16,11 +16,11 @@ class ScalarMix(torch.nn.Module):
     """
 
     def __init__(
-        self,
-        mixture_size: int,
-        do_layer_norm: bool = False,
-        initial_scalar_parameters: List[float] = None,
-        trainable: bool = True,
+            self,
+            mixture_size: int,
+            do_layer_norm: bool = False,
+            initial_scalar_parameters: List[float] = None,
+            trainable: bool = True,
     ) -> None:
         super().__init__()
         self.mixture_size = mixture_size
@@ -66,7 +66,7 @@ class ScalarMix(torch.nn.Module):
             tensor_masked = tensor * broadcast_mask
             mean = torch.sum(tensor_masked) / num_elements_not_masked
             variance = (
-                torch.sum(((tensor_masked - mean) * broadcast_mask) ** 2) / num_elements_not_masked
+                    torch.sum(((tensor_masked - mean) * broadcast_mask) ** 2) / num_elements_not_masked
             )
             return (tensor - mean) / torch.sqrt(variance + 1e-12)
 
@@ -93,3 +93,26 @@ class ScalarMix(torch.nn.Module):
                     weight * _do_layer_norm(tensor, broadcast_mask, num_elements_not_masked)
                 )
             return self.gamma * sum(pieces)
+
+
+class SumMix(torch.nn.Module):
+    def __init__(self, layers_to_sum: List):
+        super().__init__()
+        assert len(layers_to_sum) > 1
+        self.indices_to_sum = layers_to_sum
+        assert min(self.indices_to_sum) >= 0
+        self.max_layer_idx = max(self.indices_to_sum)
+
+    def forward(self, tensors: List[torch.Tensor]):
+        """
+        computes the sum of the embeddings of the layers defined self.indices_to_sum
+        :param tensors:  The input tensors can be any shape with at least two dimensions, but must all be the same shape.
+        :return: the sum of the last dimension of tensors for the indices in the first dimension corresponding to self.indices_to_sum
+        """
+        if self.max_layer_idx < len(tensors):
+            raise RuntimeError("The input indices has the index {} that is out of the bound of the input tensor "
+                               "list with size {}".format(self.max_layer_idx, len(tensors)))
+        accum_tensor = tensors[self.indices_to_sum[0]]
+        for idx in self.indices_to_sum[1:]:
+            accum_tensor = accum_tensor + tensors[idx]
+        return accum_tensor

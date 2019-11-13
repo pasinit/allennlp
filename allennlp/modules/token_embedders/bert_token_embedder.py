@@ -74,13 +74,14 @@ class BertEmbedder(TokenEmbedder):
     """
 
     def __init__(
-        self,
-        bert_model: BertModel,
-        top_layer_only: bool = False,
-        max_pieces: int = 512,
-        num_start_tokens: int = 1,
-        num_end_tokens: int = 1,
-        scalar_mix_parameters: List[float] = None,
+            self,
+            bert_model: BertModel,
+            top_layer_only: bool = False,
+            max_pieces: int = 512,
+            num_start_tokens: int = 1,
+            num_end_tokens: int = 1,
+            scalar_mix_parameters: List[float] = None,
+            mixer: torch.nn.Module = None
     ) -> None:
         super().__init__()
         self.bert_model = bert_model
@@ -89,13 +90,15 @@ class BertEmbedder(TokenEmbedder):
         self.num_start_tokens = num_start_tokens
         self.num_end_tokens = num_end_tokens
 
-        if not top_layer_only:
+        if not top_layer_only and not mixer:
             self._scalar_mix = ScalarMix(
                 bert_model.config.num_hidden_layers,
                 do_layer_norm=False,
                 initial_scalar_parameters=scalar_mix_parameters,
                 trainable=scalar_mix_parameters is None,
             )
+        elif not top_layer_only:
+            self._scalar_mix = mixer
         else:
             self._scalar_mix = None
 
@@ -103,10 +106,10 @@ class BertEmbedder(TokenEmbedder):
         return self.output_dim
 
     def forward(
-        self,
-        input_ids: torch.LongTensor,
-        offsets: torch.LongTensor = None,
-        token_type_ids: torch.LongTensor = None,
+            self,
+            input_ids: torch.LongTensor,
+            offsets: torch.LongTensor = None,
+            token_type_ids: torch.LongTensor = None,
     ) -> torch.Tensor:
         """
         Parameters
@@ -261,7 +264,6 @@ class BertEmbedder(TokenEmbedder):
 
 @TokenEmbedder.register("bert-pretrained")
 class PretrainedBertEmbedder(BertEmbedder):
-
     """
     Parameters
     ----------
@@ -283,11 +285,12 @@ class PretrainedBertEmbedder(BertEmbedder):
     """
 
     def __init__(
-        self,
-        pretrained_model: str,
-        requires_grad: bool = False,
-        top_layer_only: bool = False,
-        scalar_mix_parameters: List[float] = None,
+            self,
+            pretrained_model: str,
+            requires_grad: bool = False,
+            top_layer_only: bool = False,
+            scalar_mix_parameters: List[float] = None,
+            mixer: torch.nn.Module = None
     ) -> None:
         model = PretrainedBertModel.load(pretrained_model)
 
@@ -298,4 +301,5 @@ class PretrainedBertEmbedder(BertEmbedder):
             bert_model=model,
             top_layer_only=top_layer_only,
             scalar_mix_parameters=scalar_mix_parameters,
+            mixer=mixer
         )
