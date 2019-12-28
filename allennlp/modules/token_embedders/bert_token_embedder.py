@@ -183,11 +183,14 @@ class BertEmbedder(TokenEmbedder):
 
         # input_ids may have extra dimensions, so we reshape down to 2-d
         # before calling the BERT model and then reshape back at the end.
-        all_encoder_layers, _ = self.bert_model(
+        all_encoder_layers, *others = self.bert_model(
             input_ids=util.combine_initial_dims(input_ids),
             token_type_ids=util.combine_initial_dims(token_type_ids),
             attention_mask=util.combine_initial_dims(input_mask),
         )
+        if type(others[-1]) == tuple:
+            all_encoder_layers = others[-1]
+                                        
         all_encoder_layers = torch.stack(all_encoder_layers)
 
         if needs_split:
