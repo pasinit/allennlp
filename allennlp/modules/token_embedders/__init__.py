@@ -26,5 +26,6 @@ from allennlp.modules.token_embedders.bag_of_word_counts_token_embedder import (
 )
 from allennlp.modules.token_embedders.pass_through_token_embedder import PassThroughTokenEmbedder
 from allennlp.modules.token_embedders.pretrained_transformer_embedder import (
+    TransformerEmbedder,
     PretrainedTransformerEmbedder,
 )

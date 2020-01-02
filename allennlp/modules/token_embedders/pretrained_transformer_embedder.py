@@ -1,27 +1,284 @@
-from overrides import overrides
-from pytorch_transformers.modeling_auto import AutoModel
+from typing import Dict, List
+
 import torch
+import torch.nn.functional as F
+from pytorch_pretrained_bert.modeling import BertModel
+from transformers import AutoModel
 
+from allennlp.modules.scalar_mix import ScalarMix
 from allennlp.modules.token_embedders.token_embedder import TokenEmbedder
+from allennlp.nn import util
 
 
-@TokenEmbedder.register("pretrained_transformer")
-class PretrainedTransformerEmbedder(TokenEmbedder):
+class PretrainedTransformerModel:
     """
-    Uses a pretrained model from ``pytorch-transformers`` as a ``TokenEmbedder``.
+    In some instances you may want to load the same BERT model twice
+    (e.g. to use as a token embedder and also as a pooling layer).
+    This factory provides a cache so that you don't actually have to load the model twice.
     """
 
-    def __init__(self, model_name: str) -> None:
+    _cache: Dict[str, AutoModel] = {}
+
+    @classmethod
+    def load(cls, model_name: str, cache_model: bool = True) -> AutoModel:
+        if model_name in cls._cache:
+            return PretrainedTransformerModel._cache[model_name]
+
+        model = AutoModel.from_pretrained(model_name, output_hidden_states=True)
+        if cache_model:
+            cls._cache[model_name] = model
+
+        return model
+
+class TransformerEmbedder(TokenEmbedder):
+    """
+        A ``TokenEmbedder`` that produces BERT embeddings for your tokens.
+        Should be paired with a ``BertIndexer``, which produces wordpiece ids.
+
+        Most likely you probably want to use ``PretrainedBertEmbedder``
+        for one of the named pretrained models, not this base class.
+
+        Parameters
+        ----------
+        model: ``BertModel``
+            The BERT model being wrapped.
+        top_layer_only: ``bool``, optional (default = ``False``)
+            If ``True``, then only return the top layer instead of apply the scalar mix.
+        max_pieces : int, optional (default: 512)
+            The BERT embedder uses positional embeddings and so has a corresponding
+            maximum length for its input ids. Assuming the inputs are windowed
+            and padded appropriately by this length, the embedder will split them into a
+            large batch, feed them into BERT, and recombine the output as if it was a
+            longer sequence.
+        num_start_tokens : int, optional (default: 1)
+            The number of starting special tokens input to BERT (usually 1, i.e., [CLS])
+        num_end_tokens : int, optional (default: 1)
+            The number of ending tokens input to BERT (usually 1, i.e., [SEP])
+        scalar_mix_parameters: ``List[float]``, optional, (default = None)
+            If not ``None``, use these scalar mix parameters to weight the representations
+            produced by different layers. These mixing weights are not updated during
+            training.
+        """
+
+    def __init__(
+            self,
+            model,
+            top_layer_only: bool = False,
+            max_pieces: int = 512,
+            num_start_tokens: int = 1,
+            num_end_tokens: int = 1,
+            scalar_mix_parameters: List[float] = None,
+            mixer: torch.nn.Module = None,
+            pad_token_id:int = 0
+    ) -> None:
         super().__init__()
-        self.transformer_model = AutoModel.from_pretrained(model_name)
-        # I'm not sure if this works for all models; open an issue on github if you find a case
-        # where it doesn't work.
-        self.output_dim = self.transformer_model.config.hidden_size
+        self.model = model
+        self.output_dim = model.config.hidden_size
+        self.max_pieces = max_pieces
+        self.num_start_tokens = num_start_tokens
+        self.num_end_tokens = num_end_tokens
+        self.pad_token_id = pad_token_id
 
-    @overrides
-    def get_output_dim(self):
+        if not top_layer_only and not mixer:
+            self._scalar_mix = ScalarMix(
+                model.config.num_hidden_layers,
+                do_layer_norm=False,
+                initial_scalar_parameters=scalar_mix_parameters,
+                trainable=scalar_mix_parameters is None,
+            )
+        elif not top_layer_only:
+            self._scalar_mix = mixer
+        else:
+            self._scalar_mix = None
+
+    def get_output_dim(self) -> int:
         return self.output_dim
 
-    def forward(self, token_ids: torch.LongTensor) -> torch.Tensor:  # type: ignore
+    def forward(
+            self,
+            input_ids: torch.LongTensor,
+            offsets: torch.LongTensor = None,
+            token_type_ids: torch.LongTensor = None,
+    ) -> torch.Tensor:
+        """
+        Parameters
+        ----------
+        input_ids : ``torch.LongTensor``
+            The (batch_size, ..., max_sequence_length) tensor of wordpiece ids.
+        offsets : ``torch.LongTensor``, optional
+            The embeddings are one per wordpiece. However it's possible/likely
+            you might want one per original token. In that case, ``offsets``
+            represents the indices of the desired wordpiece for each original token.
+            Depending on how your token indexer is configured, this could be the
+            position of the last wordpiece for each token, or it could be the position
+            of the first wordpiece for each token.
 
-        return self.transformer_model(token_ids)[0]
+            For example, if you had the sentence "Definitely not", and if the corresponding
+            wordpieces were ["Def", "##in", "##ite", "##ly", "not"], then the input_ids
+            would be 5 wordpiece ids, and the "last wordpiece" offsets would be [3, 4].
+            If offsets are provided, the returned tensor will contain only the wordpiece
+            embeddings at those positions, and (in particular) will contain one embedding
+            per token. If offsets are not provided, the entire tensor of wordpiece embeddings
+            will be returned.
+        token_type_ids : ``torch.LongTensor``, optional
+            If an input consists of two sentences,
+            tokens from the first sentence should have type 0 and tokens from
+            the second sentence should have type 1.  If you don't provide this
+            (the default BertIndexer doesn't) then it's assumed to be all 0s.
+        """
+
+        batch_size, full_seq_len = input_ids.size(0), input_ids.size(-1)
+        initial_dims = list(input_ids.shape[:-1])
+
+        needs_split = full_seq_len > self.max_pieces
+        last_window_size = 0
+        if needs_split:
+            # Split the flattened list by the window size, `max_pieces`
+            split_input_ids = list(input_ids.split(self.max_pieces, dim=-1))
+            # We want all sequences to be the same length, so pad the last sequence
+            last_window_size = split_input_ids[-1].size(-1)
+            padding_amount = self.max_pieces - last_window_size
+            split_input_ids[-1] = F.pad(split_input_ids[-1], pad=[0, padding_amount], value=0)
+
+            # Now combine the sequences along the batch dimension
+            input_ids = torch.cat(split_input_ids, dim=0)
+
+            if token_type_ids is not None:
+                # Same for token_type_ids
+                split_token_type_ids = list(token_type_ids.split(self.max_pieces, dim=-1))
+
+                last_window_size = split_token_type_ids[-1].size(-1)
+                padding_amount = self.max_pieces - last_window_size
+                split_token_type_ids[-1] = F.pad(
+                    split_token_type_ids[-1], pad=[0, padding_amount], value=0
+                )
+
+                token_type_ids = torch.cat(split_token_type_ids, dim=0)
+
+        # if token_type_ids is None:
+        #     token_type_ids = torch.zeros_like(input_ids)
+
+        input_mask = (input_ids != self.pad_token_id).long()
+
+        # input_ids may have extra dimensions, so we reshape down to 2-d
+        # before calling the BERT model and then reshape back at the end.
+        all_encoder_layers, *others = self.model(
+            input_ids=util.combine_initial_dims(input_ids),
+            token_type_ids=util.combine_initial_dims(token_type_ids) if token_type_ids is not None else None,
+            attention_mask=util.combine_initial_dims(input_mask),
+        )
+        if type(others[-1]) == tuple:
+            all_encoder_layers = others[-1]
+
+        all_encoder_layers = torch.stack(all_encoder_layers)
+
+        if needs_split:
+            # First, unpack the output embeddings into one long sequence again
+            unpacked_embeddings = torch.split(all_encoder_layers, batch_size, dim=1)
+            unpacked_embeddings = torch.cat(unpacked_embeddings, dim=2)
+
+            # Next, select indices of the sequence such that it will result in embeddings representing the original
+            # sentence. To capture maximal context, the indices will be the middle part of each embedded window
+            # sub-sequence (plus any leftover start and final edge windows), e.g.,
+            #  0     1 2    3  4   5    6    7     8     9   10   11   12    13 14  15
+            # "[CLS] I went to the very fine [SEP] [CLS] the very fine store to eat [SEP]"
+            # with max_pieces = 8 should produce max context indices [2, 3, 4, 10, 11, 12] with additional start
+            # and final windows with indices [0, 1] and [14, 15] respectively.
+
+            # Find the stride as half the max pieces, ignoring the special start and end tokens
+            # Calculate an offset to extract the centermost embeddings of each window
+            stride = (self.max_pieces - self.num_start_tokens - self.num_end_tokens) // 2
+            stride_offset = stride // 2 + self.num_start_tokens
+
+            first_window = list(range(stride_offset))
+
+            max_context_windows = [
+                i
+                for i in range(full_seq_len)
+                if stride_offset - 1 < i % self.max_pieces < stride_offset + stride
+            ]
+
+            # Lookback what's left, unless it's the whole self.max_pieces window
+            if full_seq_len % self.max_pieces == 0:
+                lookback = self.max_pieces
+            else:
+                lookback = full_seq_len % self.max_pieces
+
+            final_window_start = full_seq_len - lookback + stride_offset + stride
+            final_window = list(range(final_window_start, full_seq_len))
+
+            select_indices = first_window + max_context_windows + final_window
+
+            initial_dims.append(len(select_indices))
+
+            recombined_embeddings = unpacked_embeddings[:, :, select_indices]
+        else:
+            recombined_embeddings = all_encoder_layers
+
+        # Recombine the outputs of all layers
+        # (layers, batch_size * d1 * ... * dn, sequence_length, embedding_dim)
+        # recombined = torch.cat(combined, dim=2)
+        input_mask = (recombined_embeddings != 0).long()
+
+        if self._scalar_mix is not None:
+            mix = self._scalar_mix(recombined_embeddings, input_mask)
+        else:
+            mix = recombined_embeddings[-1]
+
+        # At this point, mix is (batch_size * d1 * ... * dn, sequence_length, embedding_dim)
+
+        if offsets is None:
+            # Resize to (batch_size, d1, ..., dn, sequence_length, embedding_dim)
+            dims = initial_dims if needs_split else input_ids.size()
+            return util.uncombine_initial_dims(mix, dims)
+        else:
+            # offsets is (batch_size, d1, ..., dn, orig_sequence_length)
+            offsets2d = util.combine_initial_dims(offsets)
+            # now offsets is (batch_size * d1 * ... * dn, orig_sequence_length)
+            range_vector = util.get_range_vector(
+                offsets2d.size(0), device=util.get_device_of(mix)
+            ).unsqueeze(1)
+            # selected embeddings is also (batch_size * d1 * ... * dn, orig_sequence_length)
+            selected_embeddings = mix[range_vector, offsets2d]
+
+            return util.uncombine_initial_dims(selected_embeddings, offsets.size())
+
+
+@TokenEmbedder.register("transformer-pretrained")
+class PretrainedTransformerEmbedder(TransformerEmbedder):
+    """
+    Parameters
+    ----------
+    pretrained_model: ``str``
+        Either the name of the pretrained model to use (e.g. 'bert-base-uncased'),
+        or the path to the .tar.gz file with the model weights.
+    requires_grad : ``bool``, optional (default = False)
+        If True, compute gradient of BERT parameters for fine tuning.
+    top_layer_only: ``bool``, optional (default = ``False``)
+        If ``True``, then only return the top layer instead of apply the scalar mix.
+    scalar_mix_parameters: ``List[float]``, optional, (default = None)
+        If not ``None``, use these scalar mix parameters to weight the representations
+        produced by different layers. These mixing weights are not updated during
+        training.
+    """
+
+    def __init__(
+            self,
+            pretrained_model: str,
+            pad_token_id: int = 0,
+            requires_grad: bool = False,
+            top_layer_only: bool = False,
+            scalar_mix_parameters: List[float] = None,
+            mixer: torch.nn.Module = None
+    ) -> None:
+        model = PretrainedTransformerModel.load(pretrained_model).eval()
+        for param in model.parameters():
+            param.requires_grad = requires_grad
+
+        super().__init__(
+            model=model,
+            top_layer_only=top_layer_only,
+            scalar_mix_parameters=scalar_mix_parameters,
+            mixer=mixer,
+            pad_token_id=pad_token_id
+        )
