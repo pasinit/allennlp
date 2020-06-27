@@ -116,6 +116,7 @@ class BatchCallback(Registrable):
         batch_number: int,
         is_training: bool,
         is_master: bool,
+        metrics: Dict[str, float]
     ) -> None:
         pass
 
@@ -137,6 +138,7 @@ class TensoboardBatchMemoryUsage(BatchCallback):
         batch_number: int,
         is_training: bool,
         is_master: bool,
+        metrics: Dict[str, float]
     ) -> None:
         # In the distributed case we need to call this from every worker, since every
         # worker reports its own memory usage.
@@ -639,6 +641,7 @@ class GradientDescentTrainer(Trainer):
                     batches_this_epoch,
                     is_training=True,
                     is_master=self._master,
+                    metrics = metrics
                 )
 
         if self._distributed and not done_early:
@@ -749,6 +752,7 @@ class GradientDescentTrainer(Trainer):
                     batches_this_epoch,
                     is_training=False,
                     is_master=self._master,
+                    metrics=val_metrics
                 )
 
         if self._distributed and not done_early:
